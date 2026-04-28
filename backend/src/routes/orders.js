@@ -30,72 +30,6 @@ function hasReachedDeliveryDate(preorderDeliveryDate) {
   return Math.floor(Date.now() / 1000) >= unlockUnix;
 }
 
-// POST /api/orders - buyer places + pays for an order
-router.post('/', auth, validate.order, async (req, res) => {
-  if (req.user.role !== 'buyer') {
-    return err(res, 403, 'Only buyers can place orders', 'forbidden');
-  }
-
-const { sendPayment, getBalance, createClaimableBalance, claimBalance } = require('../utils/stellar');
-const { sendOrderEmails, sendStatusUpdateEmail, sendLowStockAlert } = require('../utils/mailer');
-const { err } = require('../middleware/error');
-const { getCachedResponse, cacheResponse } = require('../utils/idempotency');
-
-/**
- * @swagger
- * tags:
- *   name: Orders
- *   description: Order placement and management
- */
-
-/**
- * @swagger
- * /api/orders:
- *   post:
- *     summary: Place and pay for an order (buyer only)
- *     tags: [Orders]
- *     security:
- *       - bearerAuth: []
- *     parameters:
- *       - in: header
- *         name: x-idempotency-key
- *         schema: { type: string }
- *         description: Optional idempotency key to prevent duplicate orders
- *     requestBody:
- *       required: true
- *       content:
- *         application/json:
- *           schema:
- *             type: object
- *             required: [product_id, quantity]
- *             properties:
- *               product_id: { type: integer }
- *               quantity: { type: integer, minimum: 1 }
- *               address_id: { type: integer, description: Optional delivery address ID }
- *     responses:
- *       200:
- *         description: Order placed and payment successful
- *         content:
- *           application/json:
- *             schema:
- *               type: object
- *               properties:
- *                 success: { type: boolean }
- *                 orderId: { type: integer }
- *                 status: { type: string, example: paid }
- *                 txHash: { type: string }
- *                 totalPrice: { type: number }
- *       402:
- *         description: Insufficient balance or payment failed
- *         content:
- *           application/json:
- *             schema: { $ref: '#/components/schemas/Error' }
- *       403:
- *         description: Only buyers can place orders
- *         content:
- *           application/json:
- *             schema: { $ref: '#/components/schemas/Error' }
- */
 // POST /api/orders
 router.post('/', auth, validate.order, async (req, res) => {
   if (req.user.role !== 'buyer') return err(res, 403, 'Only buyers can place orders', 'forbidden');
@@ -179,21 +113,6 @@ router.post('/', auth, validate.order, async (req, res) => {
   } catch (e) {
     return err(res, 400, e.message, 'insufficient_stock');
   }
-  if (balance < totalPrice + 0.00001)
-    return res.status(402).json({ success: false, message: 'Insufficient XLM balance', code: 'insufficient_balance', required: (totalPrice + 0.00001).toFixed(7), available: balance.toFixed(7) });
-
-  // Atomic stock decrement
-  const { rowCount } = await db.query(
-    'UPDATE products SET quantity = quantity - $1 WHERE id = $2 AND quantity >= $1',
-    [quantity, product_id]
-  );
-  if (rowCount === 0) return err(res, 400, 'Insufficient stock', 'insufficient_stock');
-
-  const { rows: oRows } = await db.query(
-    'INSERT INTO orders (buyer_id, product_id, quantity, total_price, status, address_id) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id',
-    [req.user.id, product_id, quantity, totalPrice, 'pending', address_id || null]
-  );
-  const orderId = oRows[0].id;
 
   try {
     let txHash;
@@ -201,9 +120,7 @@ router.post('/', auth, validate.order, async (req, res) => {
 
     if (product.is_preorder && product.preorder_delivery_date) {
       const unlockAtUnix = parsePreorderUnlockUnix(product.preorder_delivery_date);
-      if (!unlockAtUnix) {
-        throw new Error('Invalid pre-order delivery date on product');
-      }
+      if (!unlockAtUnix) throw new Error('Invalid pre-order delivery date on product');
 
       const hold = await createPreorderClaimableBalance({
         senderSecret: buyer.stellar_secret_key,
@@ -253,12 +170,7 @@ router.post('/', auth, validate.order, async (req, res) => {
     }
 
     sendOrderEmails({
-      order: {
-        id: orderId,
-        quantity,
-        total_price: totalPrice,
-        stellar_tx_hash: txHash,
-      },
+      order: { id: orderId, quantity, total_price: totalPrice, stellar_tx_hash: txHash },
       product,
       buyer,
       farmer,
@@ -271,7 +183,11 @@ router.post('/', auth, validate.order, async (req, res) => {
     if (updated && updated.quantity <= updated.low_stock_threshold && !updated.low_stock_alerted) {
       db.prepare('UPDATE products SET low_stock_alerted = 1 WHERE id = ?').run(product_id);
       sendLowStockAlert({ product: { ...product, quantity: updated.quantity }, farmer })
-        .catch((lowStockErr) => console.error('Low-stock alert failed:', lowStockErr.message));
+        .catch((e) => console.error('Low-stock alert failed:', e.message));
+    }
+
+    if (appliedCoupon) {
+      db.prepare('UPDATE coupons SET used_count = used_count + 1 WHERE id = ?').run(appliedCoupon.id);
     }
 
     const responseData = {
@@ -285,10 +201,6 @@ router.post('/', auth, validate.order, async (req, res) => {
       preorderDeliveryDate: product.preorder_delivery_date || null,
       claimableBalanceId: balanceId,
     };
-
-    if (appliedCoupon) {
-      db.prepare('UPDATE coupons SET used_count = used_count + 1 WHERE id = ?').run(appliedCoupon.id);
-    }
 
     if (idempotencyKey) cacheResponse(idempotencyKey, responseData);
     return res.json(responseData);
@@ -315,117 +227,32 @@ router.post('/', auth, validate.order, async (req, res) => {
     };
     if (idempotencyKey) cacheResponse(idempotencyKey, errorData);
     return res.status(402).json(errorData);
-    await db.query('UPDATE orders SET status = $1, stellar_tx_hash = $2 WHERE id = $3', ['paid', txHash, orderId]);
-
-    // Referral bonus
-    if (buyer.referred_by && buyer.referral_bonus_sent === 0) {
-      const { rows: refRows } = await db.query('SELECT stellar_public_key FROM users WHERE id = $1', [buyer.referred_by]);
-      const treasurySecret = process.env.MARKETPLACE_TREASURY_SECRET;
-      if (refRows[0] && treasurySecret) {
-        sendPayment({ senderSecret: treasurySecret, receiverPublicKey: refRows[0].stellar_public_key, amount: 1.0, memo: `Referral Bonus: ${buyer.name}`.slice(0, 28) })
-          .then(() => db.query('UPDATE users SET referral_bonus_sent = 1 WHERE id = $1', [buyer.id]))
-          .catch(e => console.error('[Referral] Failed to send bonus:', e.message));
-      }
-    }
-
-    const { rows: fRows } = await db.query('SELECT id, name, email, stellar_public_key FROM users WHERE id = $1', [product.farmer_id]);
-    sendOrderEmails({ order: { id: orderId, quantity, total_price: totalPrice, stellar_tx_hash: txHash }, product, buyer, farmer: fRows[0] })
-      .catch(e => console.error('Email notification failed:', e.message));
-
-    // Low-stock check
-    const { rows: updRows } = await db.query('SELECT quantity, low_stock_threshold, low_stock_alerted FROM products WHERE id = $1', [product_id]);
-    const updated = updRows[0];
-    if (updated && updated.quantity <= updated.low_stock_threshold && !updated.low_stock_alerted) {
-      await db.query('UPDATE products SET low_stock_alerted = 1 WHERE id = $1', [product_id]);
-      sendLowStockAlert({ product: { ...product, quantity: updated.quantity }, farmer: fRows[0] })
-        .catch(e => console.error('Low-stock alert failed:', e.message));
-    }
-
-    const responseData = { success: true, orderId, status: 'paid', txHash, totalPrice };
-    await cacheResponse(idempotencyKey, responseData);
-    res.json(responseData);
-  } catch (e) {
-    await db.query('UPDATE orders SET status = $1 WHERE id = $2', ['failed', orderId]);
-    await db.query('UPDATE products SET quantity = quantity + $1 WHERE id = $2', [quantity, product_id]);
-    if (e.code === 'account_not_found')
-      return res.status(402).json({ success: false, message: 'Please fund your wallet before purchasing', code: 'unfunded_account', orderId });
-    const errorData = { success: false, message: 'Payment failed: ' + e.message, code: 'payment_failed', orderId };
-    await cacheResponse(idempotencyKey, errorData);
-    res.status(402).json(errorData);
   }
 });
 
-/**
- * @swagger
- * /api/orders:
- *   get:
- *     summary: Get buyer's order history
- *     tags: [Orders]
- *     security:
- *       - bearerAuth: []
- *     parameters:
- *       - in: query
- *         name: status
- *         schema: { type: string, enum: [pending, paid, failed] }
- *       - in: query
- *         name: page
- *         schema: { type: integer, default: 1 }
- *       - in: query
- *         name: limit
- *         schema: { type: integer, default: 20 }
- *     responses:
- *       200:
- *         description: Paginated order list
- *         content:
- *           application/json:
- *             schema:
- *               allOf:
- *                 - $ref: '#/components/schemas/PaginatedResponse'
- *                 - type: object
- *                   properties:
- *                     data:
- *                       type: array
- *                       items: { $ref: '#/components/schemas/Order' }
- */
 // GET /api/orders
-router.get('/', auth, async (req, res) => {
+router.get('/', auth, (req, res) => {
   const { status } = req.query;
   const VALID_STATUSES = ['pending', 'paid', 'processing', 'shipped', 'delivered', 'failed'];
   const page = Math.max(1, parseInt(req.query.page, 10) || 1);
   const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 20));
   const offset = (page - 1) * limit;
 
-  const conditions = ['o.buyer_id = ?'];
+  let where = 'WHERE o.buyer_id = ?';
   const params = [req.user.id];
 
   if (status && VALID_STATUSES.includes(status)) {
-    conditions.push('o.status = ?');
-  const VALID_STATUSES = ['pending', 'paid', 'failed'];
-  const page   = Math.max(1, parseInt(req.query.page) || 1);
-  const limit  = Math.min(100, Math.max(1, parseInt(req.query.limit) || 20));
-  const offset = (page - 1) * limit;
-
-  const conditions = ['o.buyer_id = $1'];
-  const params = [req.user.id];
-
-  if (status && VALID_STATUSES.includes(status)) {
-    conditions.push(`o.status = $${params.length + 1}`);
+    where += ' AND o.status = ?';
     params.push(status);
   }
-
-  const where = `WHERE ${conditions.join(' AND ')}`;
 
   const total = db
     .prepare(`SELECT COUNT(*) as count FROM orders o ${where}`)
     .get(...params).count;
 
   const data = db.prepare(
-    `SELECT o.*, p.name as product_name, p.unit, p.is_preorder, p.preorder_delivery_date, u.name as farmer_name,
-  const { rows: countRows } = await db.query(`SELECT COUNT(*) as count FROM orders o ${where}`, params);
-  const total = parseInt(countRows[0].count);
-
-  const { rows: data } = await db.query(
-    `SELECT o.*, p.name as product_name, p.unit, u.name as farmer_name,
+    `SELECT o.*, p.name as product_name, p.unit, p.is_preorder, p.preorder_delivery_date,
+            u.name as farmer_name,
             a.label as address_label, a.street as address_street, a.city as address_city,
             a.country as address_country, a.postal_code as address_postal_code
      FROM orders o
@@ -433,52 +260,15 @@ router.get('/', auth, async (req, res) => {
      JOIN users u ON p.farmer_id = u.id
      LEFT JOIN addresses a ON o.address_id = a.id
      ${where}
-     ORDER BY o.created_at DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
-    [...params, limit, offset]
-  );
+     ORDER BY o.created_at DESC LIMIT ? OFFSET ?`
+  ).all(...params, limit, offset);
 
   res.json({ success: true, data, total, page, limit, totalPages: Math.ceil(total / limit) });
 });
 
-/**
- * @swagger
- * /api/orders/sales:
- *   get:
- *     summary: Get farmer's incoming sales
- *     tags: [Orders]
- *     security:
- *       - bearerAuth: []
- *     parameters:
- *       - in: query
- *         name: page
- *         schema: { type: integer, default: 1 }
- *       - in: query
- *         name: limit
- *         schema: { type: integer, default: 20 }
- *     responses:
- *       200:
- *         description: Paginated sales list
- *         content:
- *           application/json:
- *             schema:
- *               allOf:
- *                 - $ref: '#/components/schemas/PaginatedResponse'
- *                 - type: object
- *                   properties:
- *                     data:
- *                       type: array
- *                       items: { $ref: '#/components/schemas/Order' }
- *       403:
- *         description: Farmers only
- *         content:
- *           application/json:
- *             schema: { $ref: '#/components/schemas/Error' }
- */
-// GET /api/orders/sales - farmer's incoming orders
+// GET /api/orders/sales
 router.get('/sales', auth, (req, res) => {
-  if (req.user.role !== 'farmer') {
-    return err(res, 403, 'Farmers only', 'forbidden');
-  }
+  if (req.user.role !== 'farmer') return err(res, 403, 'Farmers only', 'forbidden');
 
   const page = Math.max(1, parseInt(req.query.page, 10) || 1);
   const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 20));
@@ -489,23 +279,8 @@ router.get('/sales', auth, (req, res) => {
     .get(req.user.id).count;
 
   const data = db.prepare(
-    `SELECT o.*, p.name as product_name, p.is_preorder, p.preorder_delivery_date, u.name as buyer_name,
-// GET /api/orders/sales
-router.get('/sales', auth, async (req, res) => {
-  if (req.user.role !== 'farmer') return err(res, 403, 'Farmers only', 'forbidden');
-
-  const page   = Math.max(1, parseInt(req.query.page) || 1);
-  const limit  = Math.min(100, Math.max(1, parseInt(req.query.limit) || 20));
-  const offset = (page - 1) * limit;
-
-  const { rows: countRows } = await db.query(
-    `SELECT COUNT(*) as count FROM orders o JOIN products p ON o.product_id = p.id WHERE p.farmer_id = $1`,
-    [req.user.id]
-  );
-  const total = parseInt(countRows[0].count);
-
-  const { rows: data } = await db.query(
-    `SELECT o.*, p.name as product_name, u.name as buyer_name,
+    `SELECT o.*, p.name as product_name, p.is_preorder, p.preorder_delivery_date,
+            u.name as buyer_name,
             a.label as address_label, a.street as address_street, a.city as address_city,
             a.country as address_country, a.postal_code as address_postal_code
      FROM orders o
@@ -516,21 +291,21 @@ router.get('/sales', auth, async (req, res) => {
      ORDER BY o.created_at DESC LIMIT ? OFFSET ?`
   ).all(req.user.id, limit, offset);
 
-  res.json({
-    success: true,
-    data,
-    total,
-    page,
-    limit,
-    totalPages: Math.ceil(total / limit),
-  });
+  res.json({ success: true, data, total, page, limit, totalPages: Math.ceil(total / limit) });
 });
 
-// PATCH /api/orders/:id/status - farmer updates order status
+// GET /api/orders/:id
+router.get('/:id', auth, (req, res) => {
+  const order = db.prepare(
+    'SELECT id, status, stellar_tx_hash FROM orders WHERE id = ? AND buyer_id = ?'
+  ).get(req.params.id, req.user.id);
+  if (!order) return err(res, 404, 'Order not found', 'not_found');
+  res.json({ success: true, data: order });
+});
+
+// PATCH /api/orders/:id/status
 router.patch('/:id/status', auth, (req, res) => {
-  if (req.user.role !== 'farmer') {
-    return err(res, 403, 'Farmers only', 'forbidden');
-  }
+  if (req.user.role !== 'farmer') return err(res, 403, 'Farmers only', 'forbidden');
 
   const VALID = ['processing', 'shipped', 'delivered'];
   const { status } = req.body;
@@ -549,34 +324,6 @@ router.patch('/:id/status', auth, (req, res) => {
   if (!order) return err(res, 404, 'Order not found or not yours', 'not_found');
 
   db.prepare('UPDATE orders SET status = ? WHERE id = ?').run(status, order.id);
-     WHERE p.farmer_id = $1
-     ORDER BY o.created_at DESC LIMIT $2 OFFSET $3`,
-    [req.user.id, limit, offset]
-  );
-
-  res.json({ success: true, data, total, page, limit, totalPages: Math.ceil(total / limit) });
-});
-
-// PATCH /api/orders/:id/status
-router.patch('/:id/status', auth, async (req, res) => {
-  if (req.user.role !== 'farmer') return err(res, 403, 'Farmers only', 'forbidden');
-
-  const VALID = ['processing', 'shipped', 'delivered'];
-  const { status } = req.body;
-  if (!status || !VALID.includes(status)) return err(res, 400, `status must be one of: ${VALID.join(', ')}`, 'validation_error');
-
-  const { rows } = await db.query(
-    `SELECT o.*, p.name as product_name, p.unit, u.name as buyer_name, u.email as buyer_email
-     FROM orders o
-     JOIN products p ON o.product_id = p.id
-     JOIN users u ON o.buyer_id = u.id
-     WHERE o.id = $1 AND p.farmer_id = $2`,
-    [req.params.id, req.user.id]
-  );
-  const order = rows[0];
-  if (!order) return err(res, 404, 'Order not found or not yours', 'not_found');
-
-  await db.query('UPDATE orders SET status = $1 WHERE id = $2', [status, order.id]);
 
   sendStatusUpdateEmail({
     order,
@@ -584,29 +331,27 @@ router.patch('/:id/status', auth, async (req, res) => {
     buyer: { name: order.buyer_name, email: order.buyer_email },
     newStatus: status,
   }).catch((e) => console.error('Status email failed:', e.message));
-  }).catch(e => console.error('Status email failed:', e.message));
 
   res.json({ success: true, message: 'Order status updated' });
 });
 
-// POST /api/orders/:id/escrow — buyer funds escrow (legacy flow)
 // POST /api/orders/:id/escrow
 router.post('/:id/escrow', auth, async (req, res) => {
   if (req.user.role !== 'buyer') return err(res, 403, 'Only buyers can fund escrow', 'forbidden');
 
-  const { rows } = await db.query(
-    `SELECT o.*, p.farmer_id, u.stellar_public_key as farmer_wallet
-     FROM orders o JOIN products p ON o.product_id = p.id JOIN users u ON p.farmer_id = u.id
-     WHERE o.id = $1`,
-    [req.params.id]
-  );
-  const order = rows[0];
+  const order = db.prepare(`
+    SELECT o.*, p.farmer_id, u.stellar_public_key as farmer_wallet
+    FROM orders o
+    JOIN products p ON o.product_id = p.id
+    JOIN users u ON p.farmer_id = u.id
+    WHERE o.id = ?
+  `).get(req.params.id);
+
   if (!order) return err(res, 404, 'Order not found', 'not_found');
   if (order.buyer_id !== req.user.id) return err(res, 403, 'Not your order', 'forbidden');
   if (order.escrow_status !== 'none') return err(res, 400, 'Escrow already initiated', 'invalid_state');
 
-  const { rows: bRows } = await db.query('SELECT * FROM users WHERE id = $1', [req.user.id]);
-  const buyer = bRows[0];
+  const buyer = db.prepare('SELECT * FROM users WHERE id = ?').get(req.user.id);
   const balance = await getBalance(buyer.stellar_public_key);
   if (balance < order.total_price + 0.00001) {
     return res.status(402).json({ success: false, message: 'Insufficient XLM balance', code: 'insufficient_balance' });
@@ -619,44 +364,43 @@ router.post('/:id/escrow', auth, async (req, res) => {
       buyerPublicKey: buyer.stellar_public_key,
       amount: order.total_price,
     });
-    await db.query('UPDATE orders SET escrow_balance_id = $1, escrow_status = $2, stellar_tx_hash = $3 WHERE id = $4', [balanceId, 'funded', txHash, order.id]);
+    db.prepare('UPDATE orders SET escrow_balance_id = ?, escrow_status = ?, stellar_tx_hash = ? WHERE id = ?')
+      .run(balanceId, 'funded', txHash, order.id);
     res.json({ success: true, balanceId, txHash });
   } catch (e) {
     res.status(402).json({ success: false, message: 'Escrow creation failed: ' + e.message, code: 'escrow_failed' });
   }
 });
 
-// POST /api/orders/:id/claim — farmer claims escrow after delivery (legacy flow)
 // POST /api/orders/:id/claim
 router.post('/:id/claim', auth, async (req, res) => {
   if (req.user.role !== 'farmer') return err(res, 403, 'Only farmers can claim escrow', 'forbidden');
 
-  const { rows } = await db.query(
-    `SELECT o.* FROM orders o JOIN products p ON o.product_id = p.id WHERE o.id = $1 AND p.farmer_id = $2`,
-    [req.params.id, req.user.id]
-  );
-  const order = rows[0];
+  const order = db.prepare(`
+    SELECT o.* FROM orders o
+    JOIN products p ON o.product_id = p.id
+    WHERE o.id = ? AND p.farmer_id = ?
+  `).get(req.params.id, req.user.id);
+
   if (!order) return err(res, 404, 'Order not found or not yours', 'not_found');
   if (order.escrow_status !== 'funded') return err(res, 400, 'No funded escrow on this order', 'invalid_state');
   if (order.status !== 'delivered') return err(res, 400, 'Order must be marked delivered before claiming', 'invalid_state');
 
-  const { rows: fRows } = await db.query('SELECT * FROM users WHERE id = $1', [req.user.id]);
-  const farmer = fRows[0];
+  const farmer = db.prepare('SELECT * FROM users WHERE id = ?').get(req.user.id);
 
   try {
     const txHash = await claimBalance({ claimantSecret: farmer.stellar_secret_key, balanceId: order.escrow_balance_id });
-    await db.query('UPDATE orders SET escrow_status = $1, stellar_tx_hash = $2 WHERE id = $3', ['claimed', txHash, order.id]);
+    db.prepare('UPDATE orders SET escrow_status = ?, stellar_tx_hash = ? WHERE id = ?')
+      .run('claimed', txHash, order.id);
     res.json({ success: true, txHash });
   } catch (e) {
     res.status(402).json({ success: false, message: 'Claim failed: ' + e.message, code: 'claim_failed' });
   }
 });
 
-// POST /api/orders/:id/claim-preorder — farmer claims pre-order hold on/after delivery date
+// POST /api/orders/:id/claim-preorder
 router.post('/:id/claim-preorder', auth, async (req, res) => {
-  if (req.user.role !== 'farmer') {
-    return err(res, 403, 'Only farmers can claim pre-order payments', 'forbidden');
-  }
+  if (req.user.role !== 'farmer') return err(res, 403, 'Only farmers can claim pre-order payments', 'forbidden');
 
   const order = db.prepare(`
     SELECT o.*, p.is_preorder, p.preorder_delivery_date
@@ -682,10 +426,8 @@ router.post('/:id/claim-preorder', auth, async (req, res) => {
       claimantSecret: farmer.stellar_secret_key,
       balanceId: order.escrow_balance_id,
     });
-
     db.prepare('UPDATE orders SET escrow_status = ?, stellar_tx_hash = ? WHERE id = ?')
       .run('claimed', txHash, order.id);
-
     return res.json({ success: true, txHash, message: 'Pre-order payment claimed' });
   } catch (e) {
     return res.status(402).json({ success: false, message: 'Claim failed: ' + e.message, code: 'claim_failed' });

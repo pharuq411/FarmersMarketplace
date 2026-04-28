@@ -122,6 +122,47 @@ describe('POST /api/auth/refresh', () => {
   });
 });
 
+describe('GET /api/auth/me', () => {
+  it('returns user profile for a valid token', async () => {
+    const token = jwt.sign({ id: 42, role: 'farmer' }, SECRET);
+    mockQuery.mockResolvedValueOnce({
+      rows: [{ id: 42, name: 'Alice', email: 'alice@test.com', role: 'farmer', stellar_public_key: 'GPUB', referral_code: 'ABC1' }],
+      rowCount: 1,
+    });
+
+    const res = await request(app)
+      .get('/api/auth/me')
+      .set('Authorization', `Bearer ${token}`);
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ id: 42, name: 'Alice', role: 'farmer', email: 'alice@test.com' });
+  });
+
+  it('returns 401 without a token', async () => {
+    const res = await request(app).get('/api/auth/me');
+    expect(res.status).toBe(401);
+  });
+
+  it('returns 401 for a token with a tampered payload', async () => {
+    // Build a token signed with a different secret (simulates attacker-modified payload)
+    const tamperedToken = jwt.sign({ id: 99, role: 'admin' }, 'wrong-secret');
+    const res = await request(app)
+      .get('/api/auth/me')
+      .set('Authorization', `Bearer ${tamperedToken}`);
+    expect(res.status).toBe(401);
+  });
+
+  it('does not grant elevated role from a tampered token payload', async () => {
+    // Even if the client somehow sends a token with role=admin, the server rejects it
+    // because the signature won't verify against JWT_SECRET
+    const tamperedToken = jwt.sign({ id: 1, role: 'admin' }, 'attacker-secret');
+    const res = await request(app)
+      .get('/api/auth/me')
+      .set('Authorization', `Bearer ${tamperedToken}`);
+    expect(res.status).toBe(401);
+    expect(res.body.role).toBeUndefined();
+  });
+});
+
 describe('POST /api/auth/logout', () => {
   it('clears the refresh cookie on logout', async () => {
     const { token: csrf, cookieStr } = await getCsrf();

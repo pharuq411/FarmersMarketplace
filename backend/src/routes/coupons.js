@@ -3,9 +3,9 @@ const db = require('../db/schema');
 const auth = require('../middleware/auth');
 const { err } = require('../middleware/error');
 
-// Resolve a coupon row and validate it against a farmer + total
-function resolveCoupon(code, farmerId) {
-  const coupon = db.prepare('SELECT * FROM coupons WHERE code = ?').get(code.toUpperCase());
+async function resolveCoupon(code, farmerId) {
+  const { rows } = await db.query('SELECT * FROM coupons WHERE code = $1', [code.toUpperCase()]);
+  const coupon = rows[0];
   if (!coupon) return { error: 'Invalid coupon code', code: 'invalid_coupon' };
   if (coupon.farmer_id !== farmerId) return { error: 'Coupon not valid for this product', code: 'invalid_coupon' };
   if (coupon.expires_at && new Date(coupon.expires_at) < new Date()) return { error: 'Coupon has expired', code: 'coupon_expired' };
@@ -14,14 +14,13 @@ function resolveCoupon(code, farmerId) {
 }
 
 function calcDiscount(coupon, subtotal) {
-  if (coupon.discount_type === 'percent') {
+  if (coupon.discount_type === 'percent')
     return Math.min(parseFloat((subtotal * coupon.discount_value / 100).toFixed(7)), subtotal);
-  }
   return Math.min(coupon.discount_value, subtotal);
 }
 
-// POST /api/coupons — farmer creates a coupon
-router.post('/', auth, (req, res) => {
+// POST /api/coupons
+router.post('/', auth, async (req, res) => {
   if (req.user.role !== 'farmer') return err(res, 403, 'Only farmers can create coupons', 'forbidden');
 
   const { code, discount_type, discount_value, max_uses, expires_at } = req.body;
@@ -36,44 +35,54 @@ router.post('/', auth, (req, res) => {
     return err(res, 400, 'Percent discount cannot exceed 100', 'validation_error');
 
   try {
-    const result = db.prepare(
-      'INSERT INTO coupons (farmer_id, code, discount_type, discount_value, max_uses, expires_at) VALUES (?, ?, ?, ?, ?, ?)'
-    ).run(req.user.id, code.toUpperCase(), discount_type, value, max_uses || null, expires_at || null);
-    res.json({ success: true, id: result.lastInsertRowid, code: code.toUpperCase() });
+    const { rows } = await db.query(
+      'INSERT INTO coupons (farmer_id, code, discount_type, discount_value, max_uses, expires_at) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id',
+      [req.user.id, code.toUpperCase(), discount_type, value, max_uses || null, expires_at || null]
+    );
+    res.json({ success: true, id: rows[0].id, code: code.toUpperCase() });
   } catch (e) {
-    if (e.message.includes('UNIQUE')) return err(res, 409, 'Coupon code already exists', 'conflict');
+    if (e.message.includes('UNIQUE') || e.code === '23505') return err(res, 409, 'Coupon code already exists', 'conflict');
     throw e;
   }
 });
 
-// GET /api/coupons — farmer lists their own coupons
-router.get('/', auth, (req, res) => {
+// GET /api/coupons
+router.get('/', auth, async (req, res) => {
   if (req.user.role !== 'farmer') return err(res, 403, 'Farmers only', 'forbidden');
-  const coupons = db.prepare('SELECT * FROM coupons WHERE farmer_id = ? ORDER BY created_at DESC').all(req.user.id);
-  res.json({ success: true, data: coupons });
+  const { rows } = await db.query(
+    'SELECT * FROM coupons WHERE farmer_id = $1 ORDER BY created_at DESC',
+    [req.user.id]
+  );
+  res.json({ success: true, data: rows });
 });
 
-// DELETE /api/coupons/:id — farmer deletes own coupon
-router.delete('/:id', auth, (req, res) => {
+// DELETE /api/coupons/:id
+router.delete('/:id', auth, async (req, res) => {
   if (req.user.role !== 'farmer') return err(res, 403, 'Farmers only', 'forbidden');
-  const coupon = db.prepare('SELECT * FROM coupons WHERE id = ? AND farmer_id = ?').get(req.params.id, req.user.id);
-  if (!coupon) return err(res, 404, 'Coupon not found', 'not_found');
-  db.prepare('DELETE FROM coupons WHERE id = ?').run(req.params.id);
+  const { rows } = await db.query(
+    'SELECT * FROM coupons WHERE id = $1 AND farmer_id = $2',
+    [req.params.id, req.user.id]
+  );
+  if (!rows[0]) return err(res, 404, 'Coupon not found', 'not_found');
+  await db.query('DELETE FROM coupons WHERE id = $1', [req.params.id]);
   res.json({ success: true });
 });
 
-// POST /api/coupons/validate — buyer checks a coupon for a product
-router.post('/validate', auth, (req, res) => {
+// POST /api/coupons/validate
+router.post('/validate', auth, async (req, res) => {
   const { code, product_id } = req.body;
   if (!code || !product_id) return err(res, 400, 'code and product_id are required', 'validation_error');
 
-  const product = db.prepare('SELECT id, price, farmer_id FROM products WHERE id = ?').get(product_id);
-  if (!product) return err(res, 404, 'Product not found', 'not_found');
+  const { rows: pRows } = await db.query(
+    'SELECT id, price, farmer_id FROM products WHERE id = $1',
+    [product_id]
+  );
+  if (!pRows[0]) return err(res, 404, 'Product not found', 'not_found');
 
-  const quantity = parseInt(req.body.quantity) || 1;
-  const subtotal = product.price * quantity;
+  const quantity = parseInt(req.body.quantity, 10) || 1;
+  const subtotal = pRows[0].price * quantity;
 
-  const { coupon, error, code: errCode } = resolveCoupon(code, product.farmer_id);
+  const { coupon, error, code: errCode } = await resolveCoupon(code, pRows[0].farmer_id);
   if (error) return err(res, 400, error, errCode);
 
   const discount = calcDiscount(coupon, subtotal);

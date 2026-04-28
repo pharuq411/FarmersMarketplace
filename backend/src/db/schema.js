@@ -5,94 +5,24 @@
  *   - DATABASE_URL set → PostgreSQL (via pg pool)
  *   - DATABASE_URL unset → SQLite (via better-sqlite3, for local dev)
  *
- * Schema is managed by the migration runner (backend/migrate.js).
- * On startup this module runs all pending migrations automatically.
- *
- * Exports a unified db object:
+ * Exports a unified db object with:
  *   db.query(sql, params) → Promise<{ rows, rowCount }>
  *   db.isPostgres         → boolean
  */
 
-let db;
-try {
-  db = new Database(path.join(__dirname, '../../market.db'));
-} catch (err) {
-  console.error('[DB] Failed to open SQLite database:', err.message);
-  process.exit(1);
-}
-
-try {
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS users (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT NOT NULL,
-      email TEXT UNIQUE NOT NULL,
-      password TEXT NOT NULL,
-      role TEXT NOT NULL CHECK(role IN ('farmer', 'buyer')),
-      stellar_public_key TEXT,
-      stellar_secret_key TEXT,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    );
-
-    CREATE TABLE IF NOT EXISTS refresh_tokens (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      user_id INTEGER NOT NULL,
-      token_hash TEXT NOT NULL UNIQUE,
-      expires_at DATETIME NOT NULL,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-    );
-
-    CREATE TABLE IF NOT EXISTS products (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      farmer_id INTEGER NOT NULL,
-      name TEXT NOT NULL,
-      description TEXT,
-      category TEXT DEFAULT 'other',
-      price REAL NOT NULL,
-      quantity INTEGER NOT NULL,
-      unit TEXT DEFAULT 'unit',
-      image_url TEXT,
-      is_preorder INTEGER DEFAULT 0,
-      preorder_delivery_date TEXT,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      FOREIGN KEY (farmer_id) REFERENCES users(id)
-    );
 const USE_POSTGRES = !!process.env.DATABASE_URL;
 
 if (USE_POSTGRES) {
   const pg = require('./postgres');
-
-  // Run migrations on startup then export the pool
   const { runMigrations } = require('./migrationRunner');
   runMigrations(pg).catch(err => {
     console.error('[DB] Migration failed:', err.message);
     process.exit(1);
   });
-
-// Migrate existing DB: add columns if missing
-try { db.exec(`ALTER TABLE products ADD COLUMN category TEXT DEFAULT 'other'`); } catch {}
-try { db.exec(`ALTER TABLE products ADD COLUMN image_url TEXT`); } catch {}
-try { db.exec(`ALTER TABLE products ADD COLUMN is_preorder INTEGER DEFAULT 0`); } catch {}
-try { db.exec(`ALTER TABLE products ADD COLUMN preorder_delivery_date TEXT`); } catch {}
-try { db.exec(`ALTER TABLE products ADD COLUMN low_stock_threshold INTEGER DEFAULT 5`); } catch {}
-try { db.exec(`ALTER TABLE products ADD COLUMN low_stock_alerted INTEGER DEFAULT 0`); } catch {}
-try { db.exec(`ALTER TABLE users ADD COLUMN active INTEGER DEFAULT 1`); } catch {}
-// Allow admin role — SQLite doesn't support ALTER COLUMN, so we handle it in auth logic
-try { db.exec(`ALTER TABLE users ADD COLUMN bio TEXT`); } catch {}
-try { db.exec(`ALTER TABLE users ADD COLUMN location TEXT`); } catch {}
-try { db.exec(`ALTER TABLE users ADD COLUMN avatar_url TEXT`); } catch {}
-try { db.exec(`ALTER TABLE users ADD COLUMN referral_code TEXT UNIQUE`); } catch {}
-try { db.exec(`ALTER TABLE users ADD COLUMN federation_name TEXT UNIQUE`); } catch {}
-try { db.exec(`ALTER TABLE users ADD COLUMN referred_by INTEGER REFERENCES users(id)`); } catch {}
-try { db.exec(`ALTER TABLE users ADD COLUMN referral_bonus_sent INTEGER DEFAULT 0`); } catch {}
-try { db.exec(`ALTER TABLE products ADD COLUMN low_stock_threshold INTEGER DEFAULT 5`); } catch {}
-try { db.exec(`ALTER TABLE products ADD COLUMN low_stock_alerted INTEGER DEFAULT 0`); } catch {}
   module.exports = pg;
-
 } else {
   const Database = require('better-sqlite3');
-  const path     = require('path');
+  const path = require('path');
 
   let sqlite;
   try {
@@ -102,14 +32,7 @@ try { db.exec(`ALTER TABLE products ADD COLUMN low_stock_alerted INTEGER DEFAULT
     process.exit(1);
   }
 
-  // Build a SQLite adapter compatible with the migration runner
-  const sqliteAdapter = {
-    async query(sql, params = []) {
-      let i = 0;
-      const text = sql.replace(/\$\d+/g, () => { i++; return '?'; });
-      if (/^\s*(SELECT|WITH)/i.test(text)) {
-        const rows = sqlite.prepare(text).all(...params);
-  // Run all SQLite DDL (unchanged from original)
+  // Base schema
   try {
     sqlite.exec(`
       CREATE TABLE IF NOT EXISTS users (
@@ -161,7 +84,7 @@ try { db.exec(`ALTER TABLE products ADD COLUMN low_stock_alerted INTEGER DEFAULT
     process.exit(1);
   }
 
-  // Incremental migrations (safe — catch ignores already-exists errors)
+  // Incremental migrations
   const migrations = [
     `ALTER TABLE orders ADD COLUMN escrow_balance_id TEXT`,
     `ALTER TABLE orders ADD COLUMN escrow_status TEXT DEFAULT 'none'`,
@@ -170,6 +93,8 @@ try { db.exec(`ALTER TABLE products ADD COLUMN low_stock_alerted INTEGER DEFAULT
     `ALTER TABLE products ADD COLUMN image_url TEXT`,
     `ALTER TABLE products ADD COLUMN low_stock_threshold INTEGER DEFAULT 5`,
     `ALTER TABLE products ADD COLUMN low_stock_alerted INTEGER DEFAULT 0`,
+    `ALTER TABLE products ADD COLUMN is_preorder INTEGER DEFAULT 0`,
+    `ALTER TABLE products ADD COLUMN preorder_delivery_date TEXT`,
     `ALTER TABLE users ADD COLUMN active INTEGER DEFAULT 1`,
     `ALTER TABLE users ADD COLUMN bio TEXT`,
     `ALTER TABLE users ADD COLUMN location TEXT`,
@@ -219,18 +144,6 @@ try { db.exec(`ALTER TABLE products ADD COLUMN low_stock_alerted INTEGER DEFAULT
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
     )`,
-    `CREATE TABLE IF NOT EXISTS tags (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT NOT NULL UNIQUE,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )`,
-    `CREATE TABLE IF NOT EXISTS product_tags (
-      product_id INTEGER NOT NULL,
-      tag_id INTEGER NOT NULL,
-      PRIMARY KEY (product_id, tag_id),
-      FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE,
-      FOREIGN KEY (tag_id) REFERENCES tags(id) ON DELETE CASCADE
-    )`,
     `CREATE TABLE IF NOT EXISTS messages (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       sender_id INTEGER NOT NULL,
@@ -252,17 +165,6 @@ try { db.exec(`ALTER TABLE products ADD COLUMN low_stock_alerted INTEGER DEFAULT
     `CREATE TABLE IF NOT EXISTS stock_alerts (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       user_id INTEGER NOT NULL,
-    );
-  `);
-} catch (err) {
-  console.error('[DB] Failed to create idempotency_keys table:', err.message);
-}
-// stock_alerts table
-try {
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS stock_alerts (
-      id         INTEGER PRIMARY KEY AUTOINCREMENT,
-      user_id    INTEGER NOT NULL,
       product_id INTEGER NOT NULL,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       UNIQUE(user_id, product_id),
@@ -293,49 +195,7 @@ try {
       expires_at     DATETIME,
       created_at     DATETIME DEFAULT CURRENT_TIMESTAMP
     )`,
-  ];
-
-  for (const sql of migrations) {
-    try { sqlite.exec(sql); } catch {}
-  }
-
-  // Expose a pg-compatible async query() alongside the synchronous sqlite object
-  sqlite.query = async (text, params = []) => {
-    // Convert $1,$2,... placeholders to ? for SQLite
-    let i = 0;
-    const sqliteText = text.replace(/\$\d+/g, () => { i++; return '?'; });
-    try {
-      if (/^\s*(SELECT|WITH)/i.test(sqliteText)) {
-        const rows = sqlite.prepare(sqliteText).all(...params);
-        return { rows, rowCount: rows.length };
-      }
-      const info = sqlite.prepare(text).run(...params);
-      const returning = sql.match(/RETURNING\s+(\w+)/i);
-      const rows = returning ? [{ [returning[1]]: info.lastInsertRowid }] : [];
-      return { rows, rowCount: info.changes };
-    },
-    async exec(sql) { sqlite.exec(sql); },
-    isPostgres: false,
-    placeholder: () => '?',
-  };
-
-  // Run migrations synchronously at startup (SQLite is sync-friendly)
-  const { runMigrations } = require('./migrationRunner');
-  runMigrations(sqliteAdapter).catch(err => {
-    console.error('[DB] Migration failed:', err.message);
-    process.exit(1);
-  });
-
-  // Expose pg-compatible async query() on the sqlite instance
-  sqlite.query     = sqliteAdapter.query;
-  sqlite.isPostgres = false;
-
-  module.exports = sqlite;
-}
-// Subscriptions table
-try {
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS subscriptions (
+    `CREATE TABLE IF NOT EXISTS subscriptions (
       id            INTEGER PRIMARY KEY AUTOINCREMENT,
       buyer_id      INTEGER NOT NULL,
       product_id    INTEGER NOT NULL,
@@ -347,14 +207,8 @@ try {
       created_at    DATETIME DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY (buyer_id)   REFERENCES users(id)    ON DELETE CASCADE,
       FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE
-    );
-  `);
-} catch (err) {
-  console.error('[DB] Failed to create subscriptions table:', err.message);
-// Bundles tables
-try {
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS bundles (
+    )`,
+    `CREATE TABLE IF NOT EXISTS bundles (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       farmer_id INTEGER NOT NULL,
       name TEXT NOT NULL,
@@ -362,18 +216,16 @@ try {
       price REAL NOT NULL,
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY (farmer_id) REFERENCES users(id) ON DELETE CASCADE
-    );
-
-    CREATE TABLE IF NOT EXISTS bundle_items (
+    )`,
+    `CREATE TABLE IF NOT EXISTS bundle_items (
       bundle_id INTEGER NOT NULL,
       product_id INTEGER NOT NULL,
       quantity INTEGER NOT NULL,
       PRIMARY KEY (bundle_id, product_id),
       FOREIGN KEY (bundle_id) REFERENCES bundles(id) ON DELETE CASCADE,
       FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE
-    );
-
-    CREATE TABLE IF NOT EXISTS bundle_orders (
+    )`,
+    `CREATE TABLE IF NOT EXISTS bundle_orders (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       buyer_id INTEGER NOT NULL,
       bundle_id INTEGER NOT NULL,
@@ -383,10 +235,44 @@ try {
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY (buyer_id) REFERENCES users(id),
       FOREIGN KEY (bundle_id) REFERENCES bundles(id)
-    );
-  `);
-} catch (err) {
-  console.error('[DB] Failed to create bundles tables:', err.message);
-}
+    )`,
+    `CREATE TABLE IF NOT EXISTS tags (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL UNIQUE,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )`,
+    `CREATE TABLE IF NOT EXISTS product_tags (
+      product_id INTEGER NOT NULL,
+      tag_id INTEGER NOT NULL,
+      PRIMARY KEY (product_id, tag_id),
+      FOREIGN KEY (product_id) REFERENCES products(id) ON DELETE CASCADE,
+      FOREIGN KEY (tag_id) REFERENCES tags(id) ON DELETE CASCADE
+    )`,
+  ];
 
-module.exports = db;
+  for (const sql of migrations) {
+    try { sqlite.exec(sql); } catch {}
+  }
+
+  // Expose pg-compatible async query() on the sqlite instance
+  sqlite.query = async (text, params = []) => {
+    let i = 0;
+    const sqliteText = text.replace(/\$\d+/g, () => { i++; return '?'; });
+    try {
+      if (/^\s*(SELECT|WITH)/i.test(sqliteText)) {
+        const rows = sqlite.prepare(sqliteText).all(...params);
+        return { rows, rowCount: rows.length };
+      }
+      const info = sqlite.prepare(sqliteText).run(...params);
+      const returning = text.match(/RETURNING\s+(\w+)/i);
+      const rows = returning ? [{ [returning[1]]: info.lastInsertRowid }] : [];
+      return { rows, rowCount: info.changes };
+    } catch (err) {
+      throw err;
+    }
+  };
+
+  sqlite.isPostgres = false;
+
+  module.exports = sqlite;
+}

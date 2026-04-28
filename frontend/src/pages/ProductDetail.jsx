@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useCallback } from 'react';
+import React, { useEffect, useState, useCallback, useRef } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { api } from '../api/client';
 import { useAuth } from '../context/AuthContext';
@@ -70,6 +70,18 @@ export default function ProductDetail() {
   const [reviewLoading, setReviewLoading] = useState(false);
   const [reviewError, setReviewError] = useState('');
   const [reviewSuccess, setReviewSuccess] = useState('');
+  const [polling, setPolling] = useState(false);
+
+  const intervalRef = useRef(null);
+  const timeoutRef = useRef(null);
+  const TIMEOUT_MS = 60_000;
+
+  useEffect(() => {
+    return () => {
+      clearInterval(intervalRef.current);
+      clearTimeout(timeoutRef.current);
+    };
+  }, []);
 
   // Coupon state
   const [couponCode, setCouponCode] = useState('');
@@ -154,7 +166,23 @@ export default function ProductDetail() {
         const escrowRes = await api.fundEscrow(res.orderId);
         setResult({ ...res, escrow: true, balanceId: escrowRes.balanceId });
       } else {
-        setResult(res);
+        setPolling(true);
+        intervalRef.current = setInterval(async () => {
+          try {
+            const statusRes = await api.getOrder(res.orderId);
+            if (statusRes?.data?.status === 'paid') {
+              clearInterval(intervalRef.current);
+              clearTimeout(timeoutRef.current);
+              setPolling(false);
+              setResult(res);
+            }
+          } catch { /* ignore transient errors */ }
+        }, 3000);
+        timeoutRef.current = setTimeout(() => {
+          clearInterval(intervalRef.current);
+          setPolling(false);
+          setResult(res);
+        }, TIMEOUT_MS);
       }
     } catch (e) {
       setError(getStellarErrorMessage(e) || getErrorMessage(e));
@@ -367,9 +395,9 @@ export default function ProductDetail() {
               </label>
             )}
             <button style={{ ...s.btn, position: 'relative', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 10 }}
-              onClick={handleBuy} disabled={loading}>
+              onClick={handleBuy} disabled={loading || polling}>
               {loading && <div className="spinner-sm" style={{ width: 16, height: 16, border: '2px solid rgba(255,255,255,0.3)', borderTopColor: '#fff', borderRadius: '50%', animation: 'spin 0.6s linear infinite' }} />}
-              {loading ? t('productDetail.processing') : `${useEscrow ? t('productDetail.payToEscrow') : t('productDetail.buyNow')} · ${total} XLM`}
+              {loading || polling ? t('productDetail.processing') : `${useEscrow ? t('productDetail.payToEscrow') : t('productDetail.buyNow')} · ${total} XLM`}
             </button>
             <style>{`@keyframes spin { to { transform: rotate(360deg); } } .spinner-sm { display: inline-block; }`}</style>
           </>

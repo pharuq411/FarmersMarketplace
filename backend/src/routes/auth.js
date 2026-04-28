@@ -247,6 +247,18 @@ router.post('/refresh', async (req, res) => {
  *               properties:
  *                 ok: { type: boolean }
  */
+// GET /api/auth/me
+const authMiddleware = require('../middleware/auth');
+router.get('/me', authMiddleware, async (req, res) => {
+  const { rows } = await db.query(
+    'SELECT id, name, email, role, stellar_public_key, referral_code FROM users WHERE id = $1',
+    [req.user.id]
+  );
+  const user = rows[0];
+  if (!user) return err(res, 404, 'User not found', 'not_found');
+  res.json({ id: user.id, name: user.name, email: user.email, role: user.role, publicKey: user.stellar_public_key, referralCode: user.referral_code });
+});
+
 // POST /api/auth/logout
 router.post('/logout', async (req, res) => {
   const rawToken = req.cookies?.refreshToken;

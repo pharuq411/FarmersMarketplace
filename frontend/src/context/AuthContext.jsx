@@ -11,17 +11,10 @@ export function AuthProvider({ children }) {
   useEffect(() => {
     api.refresh()
       .then((token) => {
-        if (token) {
-          // Fetch user info from the token payload (decode without verify — server already verified)
-          const payload = JSON.parse(atob(token.split('.')[1]));
-          // We only have id + role in the token; restore full user from localStorage if available
-          const stored = (() => { try { return JSON.parse(localStorage.getItem('user')); } catch { return null; } })();
-          if (stored && stored.id === payload.id) {
-            setUser(stored);
-          } else {
-            setUser({ id: payload.id, role: payload.role });
-          }
-        }
+        if (token) return api.getMe();
+      })
+      .then((userData) => {
+        if (userData) setUser(userData);
       })
       .catch(() => {}) // no cookie or expired — stay logged out
       .finally(() => setLoading(false));
@@ -29,14 +22,12 @@ export function AuthProvider({ children }) {
 
   function login(token, userData) {
     setAccessToken(token);
-    localStorage.setItem('user', JSON.stringify(userData)); // store user profile only, NOT the token
     setUser(userData);
   }
 
   async function logout() {
     try { await api.logout(); } catch { /* best-effort */ }
     clearAccessToken();
-    localStorage.removeItem('user');
     setUser(null);
   }
 
